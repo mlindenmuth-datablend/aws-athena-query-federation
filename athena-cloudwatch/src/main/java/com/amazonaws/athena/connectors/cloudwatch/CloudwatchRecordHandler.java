@@ -153,15 +153,27 @@ public class CloudwatchRecordHandler
     }
 
     private Long getLastLogTime(CloudWatchLogsClient awsLogs, String logGroup, String logStream) {
-        DescribeLogStreamsResponse response = awsLogs.describeLogStreams(DescribeLogStreamsRequest.builder()
-                .logGroupName(logGroup)
-                .logStreamNamePrefix(logStream)
-                .limit(1)
-                .orderBy("LastEventTime")
-                .descending(true)
-                .build());
+        String nextToken = null;
+        Long lastTimestamp = null;
 
-        return response.logStreams().isEmpty() ? null : response.logStreams().get(0).lastEventTimestamp();
+        do {
+            FilterLogEventsResponse response = awsLogs.filterLogEvents(FilterLogEventsRequest.builder()
+                    .logGroupName(logGroup)
+                    .logStreamNames(logStream) // 🔥 Filter by the specific stream
+                    .limit(100) // Fetch events in batches
+                    .nextToken(nextToken)
+                    .build());
+
+            for (FilteredLogEvent event : response.events()) {
+                if (lastTimestamp == null || event.timestamp() > lastTimestamp) {
+                    lastTimestamp = event.timestamp(); // ✅ Keep track of the latest timestamp
+                }
+            }
+
+            nextToken = response.nextToken();
+        } while (nextToken != null);
+
+        return lastTimestamp; // Returns the latest log timestamp found
     }
 
     private void getQueryPassthreoughResults(BlockSpiller spiller, ReadRecordsRequest recordsRequest) throws TimeoutException, InterruptedException
