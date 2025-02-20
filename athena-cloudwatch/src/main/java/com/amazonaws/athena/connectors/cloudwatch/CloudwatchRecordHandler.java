@@ -37,11 +37,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.athena.AthenaClient;
 import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
-import software.amazon.awssdk.services.cloudwatchlogs.model.GetLogEventsRequest;
-import software.amazon.awssdk.services.cloudwatchlogs.model.GetLogEventsResponse;
-import software.amazon.awssdk.services.cloudwatchlogs.model.GetQueryResultsResponse;
-import software.amazon.awssdk.services.cloudwatchlogs.model.OutputLogEvent;
-import software.amazon.awssdk.services.cloudwatchlogs.model.ResultField;
+import software.amazon.awssdk.services.cloudwatchlogs.model.*;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
@@ -112,26 +108,31 @@ public class CloudwatchRecordHandler
             TableName tableName = recordsRequest.getTableName();
             Split split = recordsRequest.getSplit();
             invoker.setBlockSpiller(spiller);
+
+            Long lastKnownLogTime = getLastLogTime(awsLogs, split.getProperty(LOG_GROUP_FIELD), split.getProperty(LOG_STREAM_FIELD));
+
             do {
                 final String actualContinuationToken = continuationToken;
-                GetLogEventsResponse logEventsResponse = invoker.invoke(() -> awsLogs.getLogEvents(
-                        pushDownConstraints(recordsRequest.getConstraints(),
-                                GetLogEventsRequest.builder()
-                                        .logGroupName(split.getProperty(LOG_GROUP_FIELD))
-                                        //We use the property instead of the table name because of the special all_streams table
-                                        .logStreamName(split.getProperty(LOG_STREAM_FIELD))
-                                        .nextToken(actualContinuationToken)
-                                        // must be set to use nextToken correctly
-                                        .startFromHead(true)
-                                        .build()
-                        )));
+                GetLogEventsRequest.Builder requestBuilder = GetLogEventsRequest.builder()
+                        .logGroupName(split.getProperty(LOG_GROUP_FIELD))
+                        .logStreamName(split.getProperty(LOG_STREAM_FIELD))
+                        .nextToken(actualContinuationToken)
+                        .startFromHead(true);
 
-                if (continuationToken == null || !continuationToken.equals(logEventsResponse.nextForwardToken())) {
-                    continuationToken = logEventsResponse.nextForwardToken();
+                // 🚀 Set endTime to prevent infinite loop & ensure last event is included
+                if (lastKnownLogTime != null) {
+                    requestBuilder.endTime(lastKnownLogTime + 1);
                 }
-                else {
-                    continuationToken = null;
+
+                GetLogEventsResponse logEventsResponse = invoker.invoke(() -> awsLogs.getLogEvents(pushDownConstraints(recordsRequest.getConstraints(), requestBuilder.build())));
+
+                // 🛑 Break loop if no new events are found
+                if (logEventsResponse.events().isEmpty() && continuationToken != null && continuationToken.equals(logEventsResponse.nextForwardToken())) {
+                    break;
                 }
+
+                // ✅ Update continuation token correctly
+                continuationToken = logEventsResponse.nextForwardToken();
 
                 for (OutputLogEvent ole : logEventsResponse.events()) {
                     spiller.writeRows((Block block, int rowNum) -> {
@@ -149,6 +150,18 @@ public class CloudwatchRecordHandler
             }
             while (continuationToken != null && queryStatusChecker.isQueryRunning());
         }
+    }
+
+    private Long getLastLogTime(CloudWatchLogsClient awsLogs, String logGroup, String logStream) {
+        DescribeLogStreamsResponse response = awsLogs.describeLogStreams(DescribeLogStreamsRequest.builder()
+                .logGroupName(logGroup)
+                .logStreamNamePrefix(logStream)
+                .limit(1)
+                .orderBy("LastEventTime")
+                .descending(true)
+                .build());
+
+        return response.logStreams().isEmpty() ? null : response.logStreams().get(0).lastEventTimestamp();
     }
 
     private void getQueryPassthreoughResults(BlockSpiller spiller, ReadRecordsRequest recordsRequest) throws TimeoutException, InterruptedException
